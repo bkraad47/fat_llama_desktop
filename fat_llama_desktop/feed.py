@@ -1,6 +1,6 @@
 import numpy as np
 import pyfftw
-from mpi4py import MPI
+import concurrent.futures
 from pydub import AudioSegment
 import soundfile as sf
 import os
@@ -37,7 +37,7 @@ def read_audio(file_path, format):
         bitrate = wav_info.info.bitrate
     else:
         duration_seconds = len(audio) / 1000.0
-        bitrate = (len(samples) * 8) / duration_seconds  # calculate bitrate for other formats
+        bitrate = (len(samples) * 8) / duration_seconds
     
     if audio.channels == 2:
         samples = samples.reshape((-1, 2))
@@ -70,69 +70,37 @@ def initialize_ist(data, threshold):
     data_thres = np.where(mask, data, 0)
     return data_thres
 
+def perform_ist_iteration(data_thres, threshold):
+    data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
+    mask = np.abs(data_fft) > threshold
+    data_fft_thres = np.where(mask, data_fft, 0)
+    data_thres = pyfftw.interfaces.numpy_fft.ifft(data_fft_thres).real
+    return data_thres
+
 def iterative_soft_thresholding(data, max_iter, threshold):
     data_thres = initialize_ist(data, threshold)
-    for _ in range(max_iter):
-        data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
-        mask = np.abs(data_fft) > threshold
-        data_fft_thres = np.where(mask, data_fft, 0)
-        data_thres = pyfftw.interfaces.numpy_fft.ifft(data_fft_thres).real
+    
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {executor.submit(perform_ist_iteration, data_thres, threshold) for _ in range(max_iter)}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            logger.info(f"Performing IST iteration {i+1}/{max_iter}")
+            data_thres = future.result()
+    
     return data_thres
 
 def upscale_channels(channels, upscale_factor, max_iter, threshold):
-    comm = MPI.COMM_WORLD
-    size = comm.Get_size()
-    rank = comm.Get_rank()
-
-    num_channels = channels.shape[1]
-    num_elements = channels.shape[0]
-    elements_per_process = num_elements // size
-
-    # Scatter the channels to each process
-    local_channels = np.zeros((elements_per_process, num_channels), dtype=np.float32)
-    comm.Scatter(channels[:elements_per_process * size], local_channels, root=0)
-
-    processed_local_channels = []
-
-    for channel in local_channels.T:
-        logger.info(f"Process {rank} interpolating data...")
+    processed_channels = []
+    for channel in channels.T:
+        logger.info("Interpolating data...")
         expanded_channel = new_interpolation_algorithm(channel, upscale_factor)
-        
-        logger.info(f"Process {rank} performing IST...")
+
+        logger.info("Performing IST...")
         ist_changes = iterative_soft_thresholding(expanded_channel, max_iter, threshold)
         expanded_channel = expanded_channel.astype(np.float32) + ist_changes
-        
-        processed_local_channels.append(expanded_channel)
-    
-    processed_local_channels = np.array(processed_local_channels).T
 
-    # Gather the processed channels from each process
-    gathered_channels = None
-    if rank == 0:
-        gathered_channels = np.zeros((elements_per_process * size * upscale_factor, num_channels), dtype=np.float32)
+        processed_channels.append(expanded_channel)
     
-    comm.Gather(processed_local_channels, gathered_channels, root=0)
-    
-    if rank == 0:
-        remaining_elements = num_elements % size
-        if remaining_elements > 0:
-            remaining_channels = channels[-remaining_elements:]
-            processed_remaining_channels = []
-
-            for channel in remaining_channels.T:
-                logger.info("Interpolating remaining data...")
-                expanded_channel = new_interpolation_algorithm(channel, upscale_factor)
-                
-                logger.info("Performing IST on remaining data...")
-                ist_changes = iterative_soft_thresholding(expanded_channel, max_iter, threshold)
-                expanded_channel = expanded_channel.astype(np.float32) + ist_changes
-                
-                processed_remaining_channels.append(expanded_channel)
-            
-            processed_remaining_channels = np.array(processed_remaining_channels).T
-            gathered_channels = np.vstack((gathered_channels, processed_remaining_channels))
-
-    return gathered_channels if rank == 0 else None
+    return np.column_stack(processed_channels)
 
 def normalize_signal(signal):
     return signal / np.max(np.abs(signal))
@@ -187,21 +155,20 @@ def upscale(
         threshold=threshold_value
     )
     
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        logger.info("Auto-scaling amplitudes based on original audio...")
-        scaled_upscaled_channels = []
-        for i, channel in enumerate(channels.T):
-            scaled_channel = normalize_signal(upscaled_channels[:, i]) * np.max(np.abs(channel))
-            scaled_upscaled_channels.append(scaled_channel)
-        scaled_upscaled_channels = np.column_stack(scaled_upscaled_channels)
+    logger.info("Auto-scaling amplitudes based on original audio...")
+    scaled_upscaled_channels = []
+    for i, channel in enumerate(channels.T):
+        scaled_channel = normalize_signal(upscaled_channels[:, i]) * np.max(np.abs(channel))
+        scaled_upscaled_channels.append(scaled_channel)
+    scaled_upscaled_channels = np.column_stack(scaled_upscaled_channels)
 
-        logger.info("Normalizing audio...")
-        normalized_upscaled_channels = []
-        for i in range(scaled_upscaled_channels.shape[1]):
-            normalized_channel = normalize_signal(scaled_upscaled_channels[:, i])
-            normalized_upscaled_channels.append(normalized_channel)
-        normalized_upscaled_channels = np.column_stack(normalized_upscaled_channels)
+    logger.info("Normalizing audio...")
+    normalized_upscaled_channels = []
+    for i in range(scaled_upscaled_channels.shape[1]):
+        normalized_channel = normalize_signal(scaled_upscaled_channels[:, i])
+        normalized_upscaled_channels.append(normalized_channel)
+    normalized_upscaled_channels = np.column_stack(normalized_upscaled_channels)
 
-        new_sample_rate = sample_rate * upscale_factor
-        write_audio(output_file_path, new_sample_rate, normalized_upscaled_channels, target_format)
-        logger.info(f"Saved processed {target_format.upper()} file at {output_file_path}")
+    new_sample_rate = sample_rate * upscale_factor
+    write_audio(output_file_path, new_sample_rate, normalized_upscaled_channels, target_format)
+    logger.info(f"Saved processed {target_format.upper()} file at {output_file_path}")
