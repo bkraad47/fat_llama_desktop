@@ -1,0 +1,7 @@
+tk
+pydub
+numpy
+cupy-cuda12x
+soundfile
+mutagen
+fat_llama
