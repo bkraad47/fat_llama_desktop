@@ -1,0 +1,7 @@
+numpy
+scipy
+pyfftw
+pydub
+soundfile
+mutagen
+tk
