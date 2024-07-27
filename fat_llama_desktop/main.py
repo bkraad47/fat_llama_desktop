@@ -12,7 +12,6 @@ class FatLlamaApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Fat - llama")
-        self.root.iconbitmap(os.path.join(os.path.dirname(__file__), 'assets', 'logo.ico'))
         self.files = []
         self.target_folder = ""
         

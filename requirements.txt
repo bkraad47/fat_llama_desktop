@@ -1,7 +1,7 @@
-tk
-pydub
 numpy
-cupy-cuda12x
+scipy
+pyfftw
+pydub
 soundfile
 mutagen
-fat_llama
+tk

@@ -1,5 +1,4 @@
 import numpy as np
-import pyfftw
 import concurrent.futures
 from pydub import AudioSegment
 import soundfile as sf
@@ -70,32 +69,38 @@ def initialize_ist(data, threshold):
     data_thres = np.where(mask, data, 0)
     return data_thres
 
-def perform_ist_iteration(data_thres, threshold):
-    data_fft = pyfftw.interfaces.numpy_fft.fft(data_thres)
+def perform_ist_iteration(chunk, threshold, idx):
+    data_thres = chunk
+    if len(data_thres) <= 0:
+        raise ValueError("Invalid number of FFT data points specified")
+    
+    data_fft = np.fft.fft(data_thres)
     mask = np.abs(data_fft) > threshold
     data_fft_thres = np.where(mask, data_fft, 0)
-    data_thres = pyfftw.interfaces.numpy_fft.ifft(data_fft_thres).real
-    return data_thres
+    data_thres = np.fft.ifft(data_fft_thres).real
+    return idx, data_thres
 
-def iterative_soft_thresholding(data, max_iter, threshold):
-    data_thres = initialize_ist(data, threshold)
+def parallel_ist(data_thres, max_iter, threshold, n_jobs):
+    chunk_size = len(data_thres) // n_jobs
+    chunks = [(data_thres[i:i + chunk_size], i // chunk_size) for i in range(0, len(data_thres), chunk_size)]
     
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {executor.submit(perform_ist_iteration, data_thres, threshold) for _ in range(max_iter)}
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+    for i in range(max_iter):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(perform_ist_iteration, chunk, threshold, idx) for chunk, idx in chunks}
+            results = sorted([future.result() for future in concurrent.futures.as_completed(futures)], key=lambda x: x[0])
+            data_thres = np.concatenate([result[1] for result in results])
             logger.info(f"Performing IST iteration {i+1}/{max_iter}")
-            data_thres = future.result()
     
     return data_thres
 
-def upscale_channels(channels, upscale_factor, max_iter, threshold):
+def upscale_channels(channels, upscale_factor, max_iter, threshold, n_jobs):
     processed_channels = []
     for channel in channels.T:
         logger.info("Interpolating data...")
         expanded_channel = new_interpolation_algorithm(channel, upscale_factor)
 
         logger.info("Performing IST...")
-        ist_changes = iterative_soft_thresholding(expanded_channel, max_iter, threshold)
+        ist_changes = parallel_ist(expanded_channel, max_iter, threshold, n_jobs)
         expanded_channel = expanded_channel.astype(np.float32) + ist_changes
 
         processed_channels.append(expanded_channel)
@@ -112,7 +117,8 @@ def upscale(
         target_format='flac',
         max_iterations=800,
         threshold_value=0.6,
-        target_bitrate_kbps=1411
+        target_bitrate_kbps=1411,
+        n_jobs=os.cpu_count()
     ):
     valid_bitrate_ranges = {
         'flac': (800, 1411),
@@ -152,7 +158,8 @@ def upscale(
         channels,
         upscale_factor=upscale_factor,
         max_iter=max_iterations,
-        threshold=threshold_value
+        threshold=threshold_value,
+        n_jobs=n_jobs
     )
     
     logger.info("Auto-scaling amplitudes based on original audio...")
